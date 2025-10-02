@@ -6,6 +6,14 @@ const { safeRe: re, t } = require('../internal/re')
 
 const parseOptions = require('../internal/parse-options')
 const { compareIdentifiers } = require('../internal/identifiers')
+
+// LRU cache for parsed semver objects
+const LRU = require('../internal/lrucache')
+const semverCache = new LRU()
+
+// Fast path regex for simple versions (x.y.z)
+const SIMPLE_VERSION = /^(\d+)\.(\d+)\.(\d+)$/
+
 class SemVer {
   constructor (version, options) {
     options = parseOptions(options)
@@ -34,7 +42,24 @@ class SemVer {
     // don't run into trouble passing this.options around.
     this.includePrerelease = !!options.includePrerelease
 
-    const m = version.trim().match(options.loose ? re[t.LOOSE] : re[t.FULL])
+    // Check cache first
+    const cacheKey = `${version}:${this.loose}:${this.includePrerelease}`
+    const cached = semverCache.get(cacheKey)
+    if (cached) {
+      // Copy cached values to this instance
+      Object.assign(this, cached)
+      return this
+    }
+
+    const trimmedVersion = version.trim()
+
+    // Fast path for simple versions (x.y.z)
+    let m = !this.loose && SIMPLE_VERSION.exec(trimmedVersion)
+
+    if (!m) {
+      // Fall back to full regex parsing
+      m = trimmedVersion.match(options.loose ? re[t.LOOSE] : re[t.FULL])
+    }
 
     if (!m) {
       throw new TypeError(`Invalid Version: ${version}`)
@@ -76,6 +101,20 @@ class SemVer {
 
     this.build = m[5] ? m[5].split('.') : []
     this.format()
+
+    // Cache the parsed result
+    semverCache.set(cacheKey, {
+      raw: this.raw,
+      major: this.major,
+      minor: this.minor,
+      patch: this.patch,
+      prerelease: this.prerelease,
+      build: this.build,
+      version: this.version,
+      loose: this.loose,
+      includePrerelease: this.includePrerelease,
+      options: this.options,
+    })
   }
 
   format () {
@@ -92,18 +131,29 @@ class SemVer {
 
   compare (other) {
     debug('SemVer.compare', this.version, this.options, other)
+
+    // Fast path: string equality check
+    if (typeof other === 'string' && other === this.version) {
+      return 0
+    }
+
     if (!(other instanceof SemVer)) {
-      if (typeof other === 'string' && other === this.version) {
-        return 0
-      }
       other = new SemVer(other, this.options)
     }
 
+    // Fast path: version string equality
     if (other.version === this.version) {
       return 0
     }
 
-    return this.compareMain(other) || this.comparePre(other)
+    // Fast path: compare major.minor.patch as numbers (most common case)
+    const mainDiff = this.major - other.major || this.minor - other.minor || this.patch - other.patch
+    if (mainDiff !== 0) {
+      return mainDiff > 0 ? 1 : -1
+    }
+
+    // If main versions are equal, compare prerelease
+    return this.comparePre(other)
   }
 
   compareMain (other) {
